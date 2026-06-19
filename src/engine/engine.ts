@@ -14,6 +14,7 @@ import {
   hexDistance,
   hexEquals,
   hexNeighbors,
+  parseKey,
 } from './hex';
 
 export interface EcosystemSnapshot {
@@ -233,55 +234,59 @@ export class EcosystemEngine {
     const prev = this.cells;
     const next = cloneCells(prev);
 
-    const terrainOf = (c: HexCoord) => prev.get(coordKey(c))?.terrain;
     const cellOf = (c: HexCoord) => prev.get(coordKey(c));
+    const nextOf = (c: HexCoord) => next.get(coordKey(c))!;
+    const keyOf = (c: HexCoord) => coordKey(c);
 
+    // ------------------------------------------------------------
+    // 阶段 1：湿度自然衰减（所有格子）
+    // ------------------------------------------------------------
     for (const c of this.coordsList) {
-      const key = coordKey(c);
+      const key = keyOf(c);
       const p = prev.get(key)!;
       const n = next.get(key)!;
       n.moisture = Math.max(0, Math.min(1, p.moisture - cfg.moistureDecayPerStep));
     }
 
-    const waterTargets: Map<string, number> = new Map();
+    // ------------------------------------------------------------
+    // 阶段 2：水流扩散（提议 → 应用）
+    // ------------------------------------------------------------
+    const waterSpreadTargets: string[] = [];
     for (const c of this.coordsList) {
-      if (terrainOf(c) !== TerrainKind.WATER) continue;
+      if (cellOf(c)?.terrain !== TerrainKind.WATER) continue;
       const neigh = this.boundedNeighbors(c);
       const dirtNeigh = neigh.filter(
-        (nb) => terrainOf(nb) === TerrainKind.DIRT,
+        (nb) => cellOf(nb)?.terrain === TerrainKind.DIRT,
       );
-      if (dirtNeigh.length && rng() < cfg.waterSpreadChance) {
+      if (dirtNeigh.length > 0 && rng() < cfg.waterSpreadChance) {
         const t = dirtNeigh[Math.floor(rng() * dirtNeigh.length)];
-        const tk = coordKey(t);
-        waterTargets.set(tk, (waterTargets.get(tk) ?? 0) + 1);
+        waterSpreadTargets.push(keyOf(t));
       }
     }
-    for (const [k, votes] of waterTargets) {
-      if (votes > 0) {
-        const p = prev.get(k)!;
-        next.set(k, makeWater());
-        next.get(k)!.fertility = p.fertility;
-      }
+    for (const k of waterSpreadTargets) {
+      const p = prev.get(k)!;
+      next.set(k, makeWater());
+      next.get(k)!.fertility = p.fertility;
     }
 
+    // 水域对周围土壤的湿度浸润
     for (const c of this.coordsList) {
-      const key = coordKey(c);
-      const n = next.get(key)!;
-      if (n.terrain === TerrainKind.WATER) {
-        n.moisture = 1;
-        const neigh = this.boundedNeighbors(c);
-        for (const nb of neigh) {
-          const nk = coordKey(nb);
-          const nn = next.get(nk)!;
-          if (nn.terrain !== TerrainKind.WATER) {
-            nn.moisture = Math.min(1, nn.moisture + 0.08);
-          }
+      if (next.get(keyOf(c))!.terrain !== TerrainKind.WATER) continue;
+      next.get(keyOf(c))!.moisture = 1;
+      const neigh = this.boundedNeighbors(c);
+      for (const nb of neigh) {
+        const nn = nextOf(nb);
+        if (nn.terrain !== TerrainKind.WATER) {
+          nn.moisture = Math.min(1, nn.moisture + 0.08);
         }
       }
     }
 
+    // ------------------------------------------------------------
+    // 阶段 3：腐殖质老化 → 肥沃土壤
+    // ------------------------------------------------------------
     for (const c of this.coordsList) {
-      const key = coordKey(c);
+      const key = keyOf(c);
       const p = prev.get(key)!;
       const n = next.get(key)!;
       if (p.terrain === TerrainKind.HUMUS) {
@@ -297,12 +302,17 @@ export class EcosystemEngine {
       }
     }
 
-    const plantSpread: Map<string, number> = new Map();
+    // ------------------------------------------------------------
+    // 阶段 4：植物生长 + 蔓延（提议 → 应用）
+    // ------------------------------------------------------------
+    type PlantStatus = { survived: boolean; moisture: number; age: number };
+    const plantStatus = new Map<string, PlantStatus>();
+    const plantSpreadFrom = new Map<string, string[]>();
+
     for (const c of this.coordsList) {
       const p = cellOf(c)!;
       if (p.terrain !== TerrainKind.PLANT) continue;
-      const key = coordKey(c);
-      const n = next.get(key)!;
+      const key = keyOf(c);
       const neigh = this.boundedNeighbors(c);
       const waterAdj = neigh.some(
         (nb) => cellOf(nb)?.terrain === TerrainKind.WATER,
@@ -311,35 +321,44 @@ export class EcosystemEngine {
         p.moisture - cfg.moistureDecayPerStep,
         waterAdj ? 0.5 : 0,
       );
-      if (moistureNow < cfg.plantGrowMoistureMin * 0.6 && !waterAdj) {
-        next.set(key, makeHumus(Math.min(1, 0.3 + p.fertility * 0.5)));
-        continue;
-      }
-      n.age = p.age + 1;
-      n.moisture = Math.min(1, moistureNow + 0.05);
+      const died = moistureNow < cfg.plantGrowMoistureMin * 0.6 && !waterAdj;
 
-      if (
-        n.moisture >= cfg.plantSpreadMoistureMin &&
-        rng() < 0.35 + cfg.plantFertileBonus * p.fertility
-      ) {
-        const dirtNeigh = neigh.filter(
-          (nb) => cellOf(nb)?.terrain === TerrainKind.DIRT,
-        );
-        for (const t of dirtNeigh) {
-          const tk = coordKey(t);
-          const plantNeighborCount = this.boundedNeighbors(t).filter(
-            (nb) =>
-              hexEquals(nb, c)
-                ? true
-                : cellOf(nb)?.terrain === TerrainKind.PLANT,
-          ).length;
-          if (plantNeighborCount <= cfg.plantSpreadNeighborLimit) {
-            plantSpread.set(tk, (plantSpread.get(tk) ?? 0) + 1);
+      if (died) {
+        plantStatus.set(key, { survived: false, moisture: moistureNow, age: p.age });
+        next.set(key, makeHumus(Math.min(1, 0.3 + p.fertility * 0.5)));
+      } else {
+        const newMoisture = Math.min(1, moistureNow + 0.05);
+        const newAge = p.age + 1;
+        plantStatus.set(key, { survived: true, moisture: newMoisture, age: newAge });
+        const n = next.get(key)!;
+        n.moisture = newMoisture;
+        n.age = newAge;
+
+        if (
+          newMoisture >= cfg.plantSpreadMoistureMin &&
+          rng() < 0.35 + cfg.plantFertileBonus * p.fertility
+        ) {
+          const dirtNeigh = neigh.filter(
+            (nb) => cellOf(nb)?.terrain === TerrainKind.DIRT,
+          );
+          for (const t of dirtNeigh) {
+            const tk = keyOf(t);
+            const plantNeighborCount = this.boundedNeighbors(t).filter(
+              (nb) =>
+                hexEquals(nb, c)
+                  ? true
+                  : cellOf(nb)?.terrain === TerrainKind.PLANT,
+            ).length;
+            if (plantNeighborCount <= cfg.plantSpreadNeighborLimit) {
+              if (!plantSpreadFrom.has(tk)) plantSpreadFrom.set(tk, []);
+              plantSpreadFrom.get(tk)!.push(key);
+            }
           }
         }
       }
     }
-    for (const [k] of plantSpread) {
+
+    for (const [k] of plantSpreadFrom) {
       const p = prev.get(k)!;
       if (p.terrain === TerrainKind.DIRT && next.get(k)!.terrain === TerrainKind.DIRT) {
         const fertility = Math.min(1, p.fertility + 0.05);
@@ -347,144 +366,190 @@ export class EcosystemEngine {
       }
     }
 
-    type BreedOffer = { parent: string; target: string };
-    const herbBreedOffers: BreedOffer[] = [];
-    const carnBreedOffers: BreedOffer[] = [];
+    // ------------------------------------------------------------
+    // 阶段 5：草食虫 —— 捕食提议 → 冲突解决 → 饥饿死亡 → 记录存活
+    // ------------------------------------------------------------
+    type PredationOffer = { predatorKey: string; preyKey: string };
 
+    const herbPredation: PredationOffer[] = [];
     for (const c of this.coordsList) {
       const p = cellOf(c)!;
       if (p.terrain !== TerrainKind.HERBIVORE) continue;
-      const key = coordKey(c);
-      const n = next.get(key)!;
+      const key = keyOf(c);
       const neigh = this.boundedNeighbors(c);
       const plantNeigh = neigh.filter(
         (nb) => cellOf(nb)?.terrain === TerrainKind.PLANT,
       );
-      let hunger = p.hunger;
       if (plantNeigh.length > 0) {
         const t = plantNeigh[Math.floor(rng() * plantNeigh.length)];
-        const tk = coordKey(t);
-        if (next.get(tk)!.terrain === TerrainKind.PLANT) {
-          const oldPlant = cellOf(t)!;
-          next.set(
-            tk,
-            makeDirt(Math.min(1, oldPlant.fertility), oldPlant.moisture),
-          );
-          hunger = 0;
-        } else {
-          hunger = p.hunger + 1;
-        }
-      } else {
-        hunger = p.hunger + 1;
+        herbPredation.push({ predatorKey: key, preyKey: keyOf(t) });
       }
+    }
 
-      if (hunger > cfg.herbivoreMaxHunger) {
+    const herbEating = new Set<string>();
+    const plantEatenBy = new Map<string, string>();
+    const shuffledHerbOffers = [...herbPredation];
+    for (let i = shuffledHerbOffers.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      [shuffledHerbOffers[i], shuffledHerbOffers[j]] = [shuffledHerbOffers[j], shuffledHerbOffers[i]];
+    }
+    for (const offer of shuffledHerbOffers) {
+      if (plantEatenBy.has(offer.preyKey)) continue;
+      const preyStatus = plantStatus.get(offer.preyKey);
+      if (preyStatus && !preyStatus.survived) continue;
+      plantEatenBy.set(offer.preyKey, offer.predatorKey);
+      herbEating.add(offer.predatorKey);
+    }
+
+    for (const [plantKey] of plantEatenBy) {
+      const oldPlant = cellOf(parseKey(plantKey))!;
+      next.set(
+        plantKey,
+        makeDirt(Math.min(1, oldPlant.fertility), oldPlant.moisture),
+      );
+    }
+
+    const herbSurvived = new Set<string>();
+    for (const c of this.coordsList) {
+      const p = cellOf(c)!;
+      if (p.terrain !== TerrainKind.HERBIVORE) continue;
+      const key = keyOf(c);
+      const n = next.get(key)!;
+      const ate = herbEating.has(key);
+      const newHunger = ate ? 0 : p.hunger + 1;
+
+      if (newHunger > cfg.herbivoreMaxHunger) {
         next.set(key, makeHumus(0.4));
         continue;
       }
 
-      n.hunger = hunger;
+      n.hunger = newHunger;
       n.age = p.age + 1;
-
-      if (
-        hunger <= cfg.herbivoreBreedHungerThreshold &&
-        n.age >= 2
-      ) {
-        const sameKind = neigh.filter(
-          (nb) => cellOf(nb)?.terrain === TerrainKind.HERBIVORE,
-        ).length;
-        if (sameKind >= cfg.herbivoreBreedMateMin) {
-          const empty = neigh.filter(
-            (nb) =>
-              cellOf(nb)?.terrain === TerrainKind.DIRT ||
-              cellOf(nb)?.terrain === TerrainKind.PLANT,
-          );
-          if (empty.length > 0) {
-            const t = empty[Math.floor(rng() * empty.length)];
-            herbBreedOffers.push({ parent: key, target: coordKey(t) });
-          }
-        }
-      }
+      herbSurvived.add(key);
     }
 
+    // ------------------------------------------------------------
+    // 阶段 6：肉食虫 —— 捕食提议 → 冲突解决 → 饥饿死亡 → 记录存活
+    //   捕食目标基于「草食虫阶段后」的最终存活集合
+    // ------------------------------------------------------------
+    const carnPredation: PredationOffer[] = [];
     for (const c of this.coordsList) {
       const p = cellOf(c)!;
       if (p.terrain !== TerrainKind.CARNIVORE) continue;
-      const key = coordKey(c);
-      const n = next.get(key)!;
+      const key = keyOf(c);
       const neigh = this.boundedNeighbors(c);
-      const preyNeigh = neigh.filter(
-        (nb) => next.get(coordKey(nb))!.terrain === TerrainKind.HERBIVORE,
-      );
-      let hunger = p.hunger;
+      const preyNeigh = neigh.filter((nb) => herbSurvived.has(keyOf(nb)));
       if (preyNeigh.length > 0) {
         const t = preyNeigh[Math.floor(rng() * preyNeigh.length)];
-        const tk = coordKey(t);
-        const oldPrey = cellOf(t)!;
-        next.set(tk, makeHumus(0.35 + oldPrey.fertility * 0.3));
-        hunger = 0;
-      } else {
-        const prevPrey = neigh.filter(
-          (nb) => cellOf(nb)?.terrain === TerrainKind.HERBIVORE,
-        );
-        if (prevPrey.length === 0) {
-          hunger = p.hunger + 1;
-        } else {
-          hunger = p.hunger + 1;
-        }
+        carnPredation.push({ predatorKey: key, preyKey: keyOf(t) });
       }
+    }
 
-      if (hunger > cfg.carnivoreMaxHunger) {
+    const carnEating = new Set<string>();
+    const herbEatenByCarn = new Set<string>();
+    const shuffledCarnOffers = [...carnPredation];
+    for (let i = shuffledCarnOffers.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      [shuffledCarnOffers[i], shuffledCarnOffers[j]] = [shuffledCarnOffers[j], shuffledCarnOffers[i]];
+    }
+    for (const offer of shuffledCarnOffers) {
+      if (herbEatenByCarn.has(offer.preyKey)) continue;
+      if (!herbSurvived.has(offer.preyKey)) continue;
+      herbEatenByCarn.add(offer.preyKey);
+      carnEating.add(offer.predatorKey);
+    }
+
+    for (const preyKey of herbEatenByCarn) {
+      const oldPrey = cellOf(parseKey(preyKey))!;
+      next.set(preyKey, makeHumus(0.35 + oldPrey.fertility * 0.3));
+      herbSurvived.delete(preyKey);
+    }
+
+    const carnSurvived = new Set<string>();
+    for (const c of this.coordsList) {
+      const p = cellOf(c)!;
+      if (p.terrain !== TerrainKind.CARNIVORE) continue;
+      const key = keyOf(c);
+      const n = next.get(key)!;
+      const ate = carnEating.has(key);
+      const newHunger = ate ? 0 : p.hunger + 1;
+
+      if (newHunger > cfg.carnivoreMaxHunger) {
         next.set(key, makeHumus(0.45));
         continue;
       }
 
-      n.hunger = hunger;
+      n.hunger = newHunger;
       n.age = p.age + 1;
-
-      if (
-        hunger <= cfg.carnivoreBreedHungerThreshold &&
-        n.age >= 3
-      ) {
-        const sameKind = neigh.filter(
-          (nb) =>
-            hexEquals(nb, c)
-              ? false
-              : next.get(coordKey(nb))!.terrain === TerrainKind.CARNIVORE,
-        ).length;
-        if (sameKind >= cfg.carnivoreBreedMateMin) {
-          const empty = neigh.filter(
-            (nb) => {
-              const t = next.get(coordKey(nb))!.terrain;
-              return t === TerrainKind.DIRT || t === TerrainKind.PLANT;
-            },
-          );
-          if (empty.length > 0) {
-            const t = empty[Math.floor(rng() * empty.length)];
-            carnBreedOffers.push({ parent: key, target: coordKey(t) });
-          }
-        }
-      }
+      carnSurvived.add(key);
     }
 
-    const herbTargetTaken = new Set<string>();
-    herbBreedOffers.sort((a, b) => a.parent.localeCompare(b.parent));
-    for (const offer of herbBreedOffers) {
-      if (herbTargetTaken.has(offer.target)) continue;
+    // ------------------------------------------------------------
+    // 阶段 7：存活个体产卵 —— 只有最终存活的个体才能提交产卵提议
+    // ------------------------------------------------------------
+    type BreedOffer = { parent: string; target: string };
+    const herbBreedOffers: BreedOffer[] = [];
+    const carnBreedOffers: BreedOffer[] = [];
+
+    for (const key of herbSurvived) {
+      const c = parseKey(key);
+      const n = next.get(key)!;
+      if (n.hunger > cfg.herbivoreBreedHungerThreshold) continue;
+      if (n.age < 2) continue;
+      const neigh = this.boundedNeighbors(c);
+      const sameKindCount = neigh.filter(
+        (nb) => cellOf(nb)?.terrain === TerrainKind.HERBIVORE,
+      ).length;
+      if (sameKindCount < cfg.herbivoreBreedMateMin) continue;
+      const empty = neigh.filter((nb) => {
+        const t = next.get(keyOf(nb))!.terrain;
+        return t === TerrainKind.DIRT || t === TerrainKind.PLANT;
+      });
+      if (empty.length === 0) continue;
+      const t = empty[Math.floor(rng() * empty.length)];
+      herbBreedOffers.push({ parent: key, target: keyOf(t) });
+    }
+
+    for (const key of carnSurvived) {
+      const c = parseKey(key);
+      const n = next.get(key)!;
+      if (n.hunger > cfg.carnivoreBreedHungerThreshold) continue;
+      if (n.age < 3) continue;
+      const neigh = this.boundedNeighbors(c);
+      const sameKindCount = neigh.filter(
+        (nb) => !hexEquals(nb, c) && cellOf(nb)?.terrain === TerrainKind.CARNIVORE,
+      ).length;
+      if (sameKindCount < cfg.carnivoreBreedMateMin) continue;
+      const empty = neigh.filter((nb) => {
+        const t = next.get(keyOf(nb))!.terrain;
+        return t === TerrainKind.DIRT || t === TerrainKind.PLANT;
+      });
+      if (empty.length === 0) continue;
+      const t = empty[Math.floor(rng() * empty.length)];
+      carnBreedOffers.push({ parent: key, target: keyOf(t) });
+    }
+
+    // ------------------------------------------------------------
+    // 阶段 8：卵孵化（冲突解决 → 统一应用）
+    //   草食虫先孵，肉食虫后孵；同格竞争时高营养级覆盖低营养级
+    // ------------------------------------------------------------
+    const shuffledHerbBreed = [...herbBreedOffers].sort(
+      (a, b) => a.parent.localeCompare(b.parent),
+    );
+    for (const offer of shuffledHerbBreed) {
       const tt = next.get(offer.target)!;
       if (tt.terrain === TerrainKind.DIRT || tt.terrain === TerrainKind.PLANT) {
         next.set(offer.target, makeHerbivore(cfg.herbivoreBirthHunger));
-        herbTargetTaken.add(offer.target);
       }
     }
-    const carnTargetTaken = new Set<string>();
-    carnBreedOffers.sort((a, b) => a.parent.localeCompare(b.parent));
-    for (const offer of carnBreedOffers) {
-      if (carnTargetTaken.has(offer.target)) continue;
+
+    const shuffledCarnBreed = [...carnBreedOffers].sort(
+      (a, b) => a.parent.localeCompare(b.parent),
+    );
+    for (const offer of shuffledCarnBreed) {
       const tt = next.get(offer.target)!;
       if (tt.terrain === TerrainKind.DIRT || tt.terrain === TerrainKind.PLANT) {
         next.set(offer.target, makeCarnivore(cfg.carnivoreBirthHunger));
-        carnTargetTaken.add(offer.target);
       }
     }
 
